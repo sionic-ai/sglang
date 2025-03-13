@@ -47,9 +47,8 @@ class BaseImageProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
-        self.executor = concurrent.futures.ProcessPoolExecutor(
+        self.executor = concurrent.futures.ThreadPoolExecutor(
             initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
             initargs=(
                 self,
                 server_args,
