@@ -49,7 +49,7 @@ class BaseImageProcessor(ABC):
 
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
+            mp_context=mp.get_context("spawn"),
             initargs=(
                 self,
                 server_args,
