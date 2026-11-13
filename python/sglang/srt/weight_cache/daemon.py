@@ -447,7 +447,7 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        for name, buf in self.model.named_buffers(remove_duplicate=False):  # IOPS-2256 patch: shared buffers under every name
             if name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1

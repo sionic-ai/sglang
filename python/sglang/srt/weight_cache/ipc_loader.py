@@ -168,6 +168,7 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+        _iops2256_replay_dsv4_derived_state(model)  # IOPS-2256 patch
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
@@ -368,7 +369,7 @@ class IpcModelLoader(BaseModelLoader):
                 if (
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
-                ):
+                ) and not _iops2256_accept_post_load_layout(model, name):  # IOPS-2256 patch
                     mismatched.append(
                         f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
@@ -599,3 +600,127 @@ class IpcModelLoader(BaseModelLoader):
     def download_model(self, model_config) -> None:
         """No-op: daemon handles its own model downloading."""
         pass
+
+
+# IOPS-2256 patch: helpers
+_IOPS2256_MXFP4_POST_LOAD_NAMES = (
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale_inv",
+    "w2_weight_scale_inv",
+)
+
+
+def _iops2256_accept_post_load_layout(model, name):
+    module_name, _, leaf = name.rpartition(".")
+    if leaf not in _IOPS2256_MXFP4_POST_LOAD_NAMES:
+        return False
+    module = model.get_submodule(module_name)
+    qm = getattr(module, "quant_method", None)
+    if type(qm).__name__ != "Mxfp4FlashinferCutlassMoEMethod":
+        return False
+    if getattr(qm, "_use_mxfp8_act_scaling", False) or getattr(qm, "_use_sm90_humming", False):
+        return False
+    module._dsv4_mxfp4_backend = "flashinfer_cutlass_sm90"
+    return True
+
+
+def _iops2256_rebuild_meta_runner_state(model):
+    # create_moe_runner ran at init on the meta device, so device tensors it
+    # built (e.g. the per-expert swiglu clamp) are meta. Rebuild the runner now
+    # that the layer's weights live on the GPU.
+    rebuilt = 0
+    for _, module in model.named_modules():
+        qm = getattr(module, "quant_method", None)
+        if type(qm).__name__ != "Mxfp4FlashinferCutlassMoEMethod":
+            continue
+        cfg = getattr(qm, "moe_runner_config", None)
+        if cfg is not None:
+            qm.create_moe_runner(module, cfg)
+            rebuilt += 1
+    # Plain-attribute aliases of an ancestor's buffer/param captured at init
+    # (e.g. DSv4 Compressor/C4Indexer.freqs_cis = MQALayer.freqs_cis) still
+    # point at meta storage. Rebind them to the ancestor's IPC tensor.
+    modules = dict(model.named_modules())
+    rebound = 0
+    for mname, module in modules.items():
+        for k, v in list(vars(module).items()):
+            if k.startswith("_") or not isinstance(v, torch.Tensor) or v.device.type != "meta":
+                continue
+            parts = mname.split(".")
+            for depth in range(len(parts) - 1, -1, -1):
+                anc = modules.get(".".join(parts[:depth]))
+                if anc is None:
+                    continue
+                cand = anc._buffers.get(k)
+                if cand is None:
+                    cand = anc._parameters.get(k)
+                if cand is not None and cand.device.type != "meta":
+                    assert cand.shape == v.shape and cand.dtype == v.dtype, (mname, k)
+                    module.__dict__[k] = cand
+                    rebound += 1
+                    break
+    # TopK keeps gate.e_score_correction_bias inside its topk_config dataclass.
+    for mname, module in modules.items():
+        tc = getattr(module, "topk_config", None)
+        cb = getattr(tc, "correction_bias", None)
+        if isinstance(cb, torch.Tensor) and cb.device.type == "meta":
+            parent = modules[mname.rpartition(".")[0]]
+            real = parent.gate.e_score_correction_bias
+            assert real.device.type != "meta" and real.shape == cb.shape
+            tc.correction_bias = real
+            rebound += 1
+    logger.info(f"[IpcModelLoader] IOPS-2256: rebound {rebound} meta tensor aliases")
+    meta_attrs = []
+    for mname, module in model.named_modules():
+        for owner in (module, getattr(module, "quant_method", None)):
+            if owner is None or not hasattr(owner, "__dict__"):
+                continue
+            for k, v in vars(owner).items():
+                if k in ("_parameters", "_buffers"):
+                    continue
+                if isinstance(v, torch.Tensor) and v.device.type == "meta":
+                    meta_attrs.append(f"{mname}.{type(owner).__name__}.{k}")
+                elif (
+                    not isinstance(v, (torch.nn.Module, torch.Tensor))
+                    and hasattr(v, "__dict__")
+                ):
+                    for k2, v2 in vars(v).items():
+                        if isinstance(v2, torch.Tensor) and v2.device.type == "meta":
+                            meta_attrs.append(f"{mname}.{k}.{k2}")
+    logger.info(
+        f"[IpcModelLoader] IOPS-2256: rebuilt {rebuilt} MXFP4 runners; "
+        f"{len(meta_attrs)} meta tensor attrs left: {meta_attrs[:20]}"
+    )
+    if meta_attrs:
+        raise RuntimeError(f"IOPS-2256: meta tensor attrs remain: {meta_attrs[:40]}")
+
+
+def _iops2256_replay_dsv4_derived_state(model):
+    _iops2256_rebuild_meta_runner_state(model)
+    try:
+        from sglang.srt.models.deepseek_v4 import DeepseekV4PlatformDecoderLayer
+    except ImportError:
+        return
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        return
+    n = 0
+    for layer_id in range(inner.start_layer, inner.end_layer):
+        layer = layers[layer_id]
+        if hasattr(layer, "refresh_mhc_norm_weight_cache"):
+            layer.refresh_mhc_norm_weight_cache()
+            if hasattr(layer.self_attn, "refresh_attn_sink_cache"):
+                layer.self_attn.refresh_attn_sink_cache()
+            for comp in (
+                getattr(layer.self_attn, "compressor", None),
+                getattr(getattr(layer.self_attn, "indexer", None), "compressor", None),
+            ):
+                if comp is not None and hasattr(comp, "ape_converted"):
+                    comp.ape_converted = True
+            n += 1
+    for i, layer in enumerate(layers):
+        if isinstance(layer, DeepseekV4PlatformDecoderLayer):
+            layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
+    logger.info(f"[IpcModelLoader] IOPS-2256: replayed DSv4 derived state on {n} layers")
